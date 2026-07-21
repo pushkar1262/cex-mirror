@@ -1,0 +1,22 @@
+# A single lightweight container mirrors ALL pairs, replacing the previous
+# one-Hummingbot-container-per-pair setup.
+services:
+  cex-mirror:
+    build: .
+    container_name: cex-mirror
+    restart: unless-stopped
+    environment:
+      - MYCEX_JWT=${MYCEX_JWT}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"

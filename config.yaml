@@ -1,0 +1,55 @@
+# cex-mirror configuration
+#
+# One file replaces the previous per-pair Hummingbot script-config YAMLs
+# (conf_binance_to_my_cex_orderbook_mirror_*.yml) and the per-pair Docker containers.
+# Every field under `defaults` may be overridden per pair.
+
+mycex:
+  jwt_env: MYCEX_JWT  # env var holding the raw JWT
+  order_service_url: https://order-exchange.antiers.work
+  max_concurrency: 20
+  max_retries: 4
+  request_timeout: 10.0
+
+status_interval: 2.0  # seconds between status prints (0 to disable)
+cancel_on_shutdown: true  # cancel resting orders on Ctrl-C / SIGTERM
+reconcile_on_startup: true  # adopt pre-existing open orders on startup (crash recovery)
+
+defaults:
+  levels: 15
+  max_order_amount: 0  # 0 = use exact source amount; e.g. 0.001 to cap
+  price_precision: "0.01"
+  amount_tolerance: 0.05
+  refresh_interval: 1.0
+  mirror_market_orders: true
+  max_market_order_amount: 0
+  min_seconds_between_market_orders: 0
+  min_notional: 5
+
+# Values below mirror the original conf_binance_to_my_cex_orderbook_mirror_*.yml files.
+pairs:
+  - source: BTC-USDT
+    mycex: BTC-USDT
+    levels: 60
+    max_order_amount: 1
+    price_precision: "0.01"
+    amount_precision: "0.00001"
+    refresh_interval: 1
+
+  # - source: ETH-USDT
+  #   mycex: ETH-USDT
+  #   levels: 15
+  #   amount_precision: "0.0001"
+  #   refresh_interval: 1.0
+
+  # - source: SOL-USDT
+  #   mycex: SOL-USDT
+  #   levels: 15
+  #   amount_precision: "0.0001"
+  #   refresh_interval: 1.0
+
+  # - source: DOT-USDT
+  #   mycex: DOT-USDT
+  #   levels: 15
+  #   amount_precision: "0.001"
+  #   refresh_interval: 0.5
