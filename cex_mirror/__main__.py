@@ -33,6 +33,12 @@ def _setup_logging() -> None:
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+    # aiokafka's own INFO logs (subscription state, group coordinator join/sync/leave,
+    # partition assignments) are noisy connection housekeeping — quiet them to WARNING
+    # so only our own "connecting/connected/event received" lines and real problems show.
+    # Respects LOG_LEVEL=DEBUG: if you're debugging, keep aiokafka's chatter too.
+    if getattr(logging, level, logging.INFO) > logging.DEBUG:
+        logging.getLogger("aiokafka").setLevel(logging.WARNING)
 
 
 async def _reconcile_loop(engine: MirrorEngine, stop: asyncio.Event) -> None:
@@ -56,6 +62,21 @@ async def _status_loop(manager: PairManager, stop: asyncio.Event, interval: floa
             await asyncio.wait_for(stop.wait(), timeout=interval)
         except asyncio.TimeoutError:
             print(format_status(manager.engines), flush=True)
+
+
+async def _pending_retry_loop(manager: PairManager, stop: asyncio.Event, interval: float) -> None:
+    """Periodically retry pairs the order service didn't know yet (auto-start once
+    it registers them). Only relevant with Kafka; harmless if nothing is pending."""
+    if interval <= 0:
+        return
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            try:
+                await manager.retry_pending()
+            except Exception:
+                log.exception("pending-pair retry error")
 
 
 async def run(cfg: Config, config_path: str) -> None:
@@ -106,12 +127,11 @@ async def run(cfg: Config, config_path: str) -> None:
             cfg, client, feed, engines_by_symbol, start_reconcile_loop, config_path
         )
 
-        # Register statically-configured pairs (startup recovery, then reconcile loop).
-        static_engines = [MirrorEngine(p, client, feed) for p in cfg.pairs]
-        if cfg.reconcile_on_startup and static_engines:
-            await asyncio.gather(*(e.adopt_open_orders() for e in static_engines))
-        for eng in static_engines:
-            manager.register_static(eng, start_reconcile_loop(eng))
+        # Start statically-configured pairs through the same path as Kafka-added ones,
+        # so a configured pair the order service doesn't know yet is queued (and retried)
+        # rather than spamming "unknown market" 400s. persist=False: already in config.
+        if cfg.pairs:
+            await asyncio.gather(*(manager.add_pair(p, persist=False) for p in cfg.pairs))
 
         # Signal handling for graceful shutdown.
         loop = asyncio.get_running_loop()
@@ -121,7 +141,7 @@ async def run(cfg: Config, config_path: str) -> None:
             except NotImplementedError:
                 pass  # e.g. Windows
 
-        status_task = asyncio.create_task(_status_loop(manager, stop, cfg.status_interval))
+        aux_tasks = [asyncio.create_task(_status_loop(manager, stop, cfg.status_interval))]
 
         # Start the market-lifecycle consumer so admin-created pairs auto-start.
         consumer: MarketLifecycleConsumer | None = None
@@ -132,6 +152,10 @@ async def run(cfg: Config, config_path: str) -> None:
             except Exception as e:
                 log.error("Kafka consumer failed to start (continuing without it): %s", e)
                 consumer = None
+            # Retry pairs the order service didn't know yet (only meaningful with Kafka).
+            aux_tasks.append(asyncio.create_task(
+                _pending_retry_loop(manager, stop, cfg.kafka.pending_retry_interval)
+            ))
 
         log.info(
             "Mirror running for %d pair(s)%s. Ctrl-C to stop.",
@@ -144,10 +168,11 @@ async def run(cfg: Config, config_path: str) -> None:
         if consumer is not None:
             await consumer.stop()
 
-        status_task.cancel()
+        for t in aux_tasks:
+            t.cancel()
         for t in manager.tasks:
             t.cancel()
-        await asyncio.gather(status_task, *manager.tasks, return_exceptions=True)
+        await asyncio.gather(*aux_tasks, *manager.tasks, return_exceptions=True)
         await feed.stop()
 
         if cfg.cancel_on_shutdown:

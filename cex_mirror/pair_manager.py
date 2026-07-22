@@ -33,7 +33,7 @@ from .config import (
     remove_pair_from_yaml,
 )
 from .mirror_engine import MirrorEngine
-from .mycex_client import MyCexClient
+from .mycex_client import MyCexClient, MyCexError
 
 log = logging.getLogger("cex_mirror.pairs")
 
@@ -77,6 +77,9 @@ class PairManager:
         self._tasks: List[asyncio.Task] = []
         # Binance symbol -> its reconcile-loop task, so a single pair can be torn down.
         self._task_by_symbol: Dict[str, asyncio.Task] = {}
+        # Pairs the order service didn't know yet — retried periodically (source_symbol
+        # -> PairConfig). Avoids order-placement spam for markets my_cex hasn't registered.
+        self._pending: Dict[str, PairConfig] = {}
         self._lock = asyncio.Lock()
 
     @property
@@ -87,15 +90,8 @@ class PairManager:
     def tasks(self) -> List[asyncio.Task]:
         return self._tasks
 
-    def register_static(self, engine: MirrorEngine, task: asyncio.Task) -> None:
-        """Adopt an engine/loop that __main__ created for a startup-configured pair."""
-        self._engines.append(engine)
-        self._tasks.append(task)
-        self._task_by_symbol[engine.source_symbol] = task
-        self._engines_by_symbol[engine.source_symbol] = engine
-
     # ------------------------------------------------------------------
-    # Kafka-driven dynamic add
+    # Dynamic add (startup-configured and Kafka-driven)
     # ------------------------------------------------------------------
 
     async def handle_market_event(self, event: dict) -> None:
@@ -147,11 +143,14 @@ class PairManager:
 
         await self.add_pair(pair)
 
-    async def add_pair(self, pair: PairConfig) -> bool:
-        """Start mirroring `pair` at runtime. Returns True if newly started.
+    async def add_pair(self, pair: PairConfig, *, persist: bool = True) -> bool:
+        """Start mirroring `pair`. Returns True if newly started.
 
-        Idempotent per market symbol. Validates the source symbol on Binance first
-        (skip if absent). Existing engines are never touched.
+        Idempotent per market symbol. Validates the source symbol on Binance and that
+        the order service knows the market (unknown -> queued for retry, no order spam).
+        Existing engines are never touched. Used for both startup-configured pairs
+        (persist=False, they're already in config.yaml) and Kafka-added pairs
+        (persist=True, appended to config.yaml).
         """
         async with self._lock:
             if pair.source_symbol in self._engines_by_symbol:
@@ -165,6 +164,33 @@ class PairManager:
                     pair.source_symbol, pair.mycex_symbol,
                 )
                 return False
+
+            # Order service must know the market, else every placed order 400s
+            # ("unknown market") and floods the log. If unknown (or exchange-info is
+            # momentarily unreachable), queue it and retry later instead of starting.
+            newly_pending = pair.source_symbol not in self._pending
+            try:
+                known = await self._client.symbol_known(pair.mycex_symbol)
+            except MyCexError as e:
+                self._pending[pair.source_symbol] = pair
+                if newly_pending:
+                    log.warning(
+                        "Could not verify %s on order service (%s); queued, will retry",
+                        pair.mycex_symbol, e,
+                    )
+                return False
+            if not known:
+                self._pending[pair.source_symbol] = pair
+                if newly_pending:
+                    log.info(
+                        "Order service does not know %s yet; queued, will start when "
+                        "it is registered (no orders placed meanwhile)",
+                        pair.mycex_symbol,
+                    )
+                return False
+
+            # Known now — clear any pending entry and proceed.
+            self._pending.pop(pair.source_symbol, None)
 
             log.info("Starting mirror for new pair %s (source %s)", pair.mycex, pair.source_symbol)
 
@@ -187,14 +213,36 @@ class PairManager:
             self._tasks.append(task)
             self._task_by_symbol[pair.source_symbol] = task
 
-        # Persist outside the lock (file I/O); append is itself idempotent.
-        try:
-            append_pair_to_yaml(self._config_path, pair)
-        except Exception:
-            log.exception("Failed to persist pair %s to %s", pair.mycex, self._config_path)
+        # Persist outside the lock (file I/O); append is itself idempotent. Skipped for
+        # startup-configured pairs, which are already present in config.yaml.
+        if persist:
+            try:
+                append_pair_to_yaml(self._config_path, pair)
+            except Exception:
+                log.exception("Failed to persist pair %s to %s", pair.mycex, self._config_path)
 
         log.info("Mirror active for %s; %d pair(s) total", pair.mycex, len(self._engines))
         return True
+
+    async def retry_pending(self) -> None:
+        """Re-attempt pairs the order service didn't know yet; start any now-registered.
+
+        Called periodically by __main__. add_pair() re-checks and re-queues on failure,
+        so this just replays a snapshot of the pending set. Logs which pairs are still
+        waiting on the order service, so it's clear the blocker is on that side.
+        """
+        if not self._pending:
+            return
+        waiting = sorted(p.mycex_symbol for p in self._pending.values())
+        log.info(
+            "Retrying %d pair(s) not yet active on the order service: %s",
+            len(waiting), ", ".join(waiting),
+        )
+        for symbol, pair in list(self._pending.items()):
+            # add_pair pops it from _pending on success; leaves it if still unknown.
+            if symbol not in self._pending:
+                continue  # started by a concurrent event
+            await self.add_pair(pair)
 
     # ------------------------------------------------------------------
     # Kafka-driven dynamic remove (delist)
@@ -212,12 +260,19 @@ class PairManager:
         async with self._lock:
             # market_id is the no-separator symbol; match it against either side of
             # each engine's pair (source/mycex are identical for Kafka-added pairs).
+            # A market that was only queued (order service didn't know it yet) should
+            # stop being retried when it's delisted/disabled.
+            was_pending = self._pending.pop(market_id, None) is not None
+
             engine = self._find_engine(market_id)
             if engine is None:
-                log.info("market.delisted %s: not currently mirroring; nothing to stop", market_id)
+                if was_pending:
+                    log.info("market %s was pending (never started); dropped from retry queue", market_id)
+                else:
+                    log.info("market.delisted %s: not currently mirroring; nothing to stop", market_id)
                 # Still clean config in case it lingered from a prior run.
                 self._safe_remove_from_config(market_id)
-                return False
+                return was_pending
 
             source_symbol = engine.source_symbol
             log.info("Delisting %s: stopping mirror", engine.pair.mycex)

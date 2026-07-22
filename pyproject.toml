@@ -13,8 +13,13 @@ dependencies = [
 
 [project.optional-dependencies]
 # Needed only when kafka.enabled: true (auto-add pairs from the market-lifecycle topic).
+# cramjam supplies the snappy/lz4/zstd/gzip decompression codecs aiokafka needs when the
+# producer compresses messages (snappy is a common broker/producer default).
 kafka = [
     "aiokafka>=0.10",
+    "cramjam>=2.7",
+    # Round-trip YAML so runtime add/remove of pairs preserves config.yaml comments.
+    "ruamel.yaml>=0.18",
 ]
 
 [project.scripts]

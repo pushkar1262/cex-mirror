@@ -114,8 +114,8 @@ Behaviour:
   its resting orders, unsubscribes its Binance feed, and removes it from `config.yaml`.
   Every other running pair is left untouched. Removing a pair that isn't running is a
   harmless no-op.
-- The pair set is persisted via a full PyYAML rewrite of `config.yaml`; hand-written
-  comments in that file are not preserved once the first dynamic add/remove is written.
+- The pair set is persisted to `config.yaml` via a `ruamel.yaml` round-trip, so your
+  hand-written comments and formatting are preserved across runtime add/remove.
 
 With `kafka.enabled: true` you may start with an empty `pairs:` list and let every pair
 arrive over Kafka.

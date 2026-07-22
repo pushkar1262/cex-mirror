@@ -11,6 +11,17 @@ mycex:
   max_retries: 2
   request_timeout: 5.0
 
+# Auto-add/remove pairs the admin panel creates. Other services are notified over the
+# `market-lifecycle` Kafka topic; when enabled, this consumer starts mirroring a
+# newly-created/enabled market immediately AND appends it here so a restart resumes it.
+# A disabled/delisted market stops mirroring. Pairs Binance does not list are skipped.
+kafka:
+  enabled: true
+  bootstrap_servers: localhost:9092  # comma-separated for multiple brokers
+  topic: market-lifecycle
+  group_id: cex-mirror
+  auto_offset_reset: latest  # latest = only new events; earliest = replay history
+
 status_interval: 5.0  # seconds between status prints (0 to disable)
 cancel_on_shutdown: true  # cancel resting orders on Ctrl-C / SIGTERM
 reconcile_on_startup: false  # adopt pre-existing open orders on startup (crash recovery)
@@ -19,14 +30,15 @@ defaults:
   levels: 15
   max_order_amount: 0  # 0 = use exact source amount; e.g. 0.001 to cap
   price_precision: "0.01"
-  amount_tolerance: 0.10 # 0.05 = 5% of the amount
-  refresh_interval: 1.0  
+  amount_tolerance: 0.10  # 0.10 = 10% of the amount
+  refresh_interval: 1.0
   mirror_market_orders: true
   max_market_order_amount: 0
-  min_seconds_between_market_orders: 1.0 # 0 = no throttle
+  min_seconds_between_market_orders: 1.0  # 0 = no throttle
   min_notional: 5
 
 # Values below mirror the original conf_binance_to_my_cex_orderbook_mirror_*.yml files.
+# Pairs added at runtime via Kafka are appended here automatically
 pairs:
   - source: BTC-USDT
     mycex: BTC-USDT

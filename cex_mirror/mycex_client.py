@@ -108,6 +108,22 @@ class MyCexClient:
         data = await self._request("GET", "/api/v1/exchange-info")
         return data if isinstance(data, list) else data.get("symbols", [])
 
+    async def symbol_known(self, symbol: str) -> bool:
+        """Whether the order service knows this market (no-separator symbol, e.g.
+        DOGEUSDT). Placing orders for an unknown market returns HTTP 400
+        'unknown market', so a dynamically-added pair should check this first.
+
+        Raises MyCexError if exchange-info can't be reached, so callers can retry
+        later rather than treating a transient failure as 'not listed'."""
+        symbol = symbol.upper()
+        for s in await self.exchange_info():
+            sym = str(s.get("Symbol") or s.get("symbol") or "").upper()
+            if sym == symbol:
+                status = str(s.get("Status") or s.get("status") or "").upper()
+                # Empty status treated as known/tradeable (be lenient on field shape).
+                return status in ("", "TRADING")
+        return False
+
     async def place_order(
         self,
         *,

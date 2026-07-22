@@ -53,6 +53,9 @@ class KafkaSettings(BaseModel):
     # Where to start when the group has no committed offset: "latest" (only new
     # events) or "earliest" (replay history). "latest" is right for live add-a-pair.
     auto_offset_reset: str = "latest"
+    # How often (seconds) to retry pairs the order service didn't know yet, so they
+    # auto-start once it registers them. 0 disables retrying (skip permanently).
+    pending_retry_interval: float = 15.0
 
     @field_validator("bootstrap_servers", mode="before")
     @classmethod
@@ -209,37 +212,66 @@ def pair_from_market_event(event: dict, defaults: PairDefaults) -> Optional[Pair
     return PairConfig(**merged)
 
 
+def _symbol_norm(sym) -> str:
+    """No-separator upper form, e.g. 'BTC-USDT' -> 'BTCUSDT'."""
+    return str(sym or "").replace("-", "").replace("/", "").upper()
+
+
+def _ruamel():
+    """A round-trip YAML handler that preserves comments, indentation, and quoting."""
+    from ruamel.yaml import YAML  # imported lazily; only needed when persisting
+
+    y = YAML()
+    y.preserve_quotes = True
+    # Match the hand-written config.yaml layout: list items indented under their key
+    # (two-space block sequence with the dash offset two spaces in).
+    y.indent(mapping=2, sequence=4, offset=2)
+    return y
+
+
 def append_pair_to_yaml(path: str | Path, pair: PairConfig) -> None:
     """Persist a runtime-added pair into config.yaml so a restart resumes it.
 
-    Full-file rewrite via PyYAML (comments are not preserved). Idempotent: a pair
-    whose `mycex` already appears under `pairs:` is left untouched.
+    Uses ruamel.yaml round-trip so existing comments and formatting are preserved.
+    Idempotent: a pair whose `mycex` already appears under `pairs:` is left untouched.
     """
     path = Path(path)
-    raw = yaml.safe_load(path.read_text()) or {}
-    existing = raw.get("pairs") or []
+    y = _ruamel()
+    with path.open("r") as f:
+        data = y.load(f) or {}
 
-    def _norm(sym: str) -> str:
-        return str(sym or "").replace("-", "").replace("/", "").upper()
+    existing = data.get("pairs")
+    if existing is None:
+        from ruamel.yaml.comments import CommentedSeq
 
-    if any(_norm(e.get("mycex") or e.get("source")) == pair.mycex_symbol for e in existing):
+        existing = CommentedSeq()
+        data["pairs"] = existing
+
+    if any(_symbol_norm(e.get("mycex") or e.get("source")) == pair.mycex_symbol for e in existing):
         return
 
-    entry = {
-        "source": pair.source,
-        "mycex": pair.mycex,
-        "levels": pair.levels,
-        "price_precision": pair.price_precision,
-        "amount_precision": pair.amount_precision,
-        "refresh_interval": pair.refresh_interval,
-    }
+    from ruamel.yaml.comments import CommentedMap
+    from ruamel.yaml.scalarstring import DoubleQuotedScalarString as dq
+
+    entry = CommentedMap()
+    entry["source"] = pair.source
+    entry["mycex"] = pair.mycex
+    entry["levels"] = pair.levels
+    # Quote the precision steps (double-quoted, matching the hand-written entries) so
+    # YAML keeps them as strings — e.g. "0.001", not the float 0.001.
+    entry["price_precision"] = dq(pair.price_precision)
+    entry["amount_precision"] = dq(pair.amount_precision)
+    entry["refresh_interval"] = pair.refresh_interval
     # Only serialise a cap when one is actually set (0 = "use exact source amount").
     if pair.max_order_amount > 0:
         entry["max_order_amount"] = str(pair.max_order_amount)
 
     existing.append(entry)
-    raw["pairs"] = existing
-    path.write_text(yaml.safe_dump(raw, sort_keys=False, default_flow_style=False))
+    # Blank line before the new entry, matching the spacing between hand-written pairs.
+    if len(existing) > 1:
+        existing.yaml_set_comment_before_after_key(len(existing) - 1, before="\n")
+    with path.open("w") as f:
+        y.dump(data, f)
     log.info("Persisted pair %s to %s", pair.mycex, path)
 
 
@@ -247,21 +279,26 @@ def remove_pair_from_yaml(path: str | Path, mycex_symbol: str) -> bool:
     """Drop any pair whose symbol matches `mycex_symbol` (no-separator form, e.g.
     TICSUSDT) from config.yaml so a restart does not resurrect a delisted market.
 
-    Full-file rewrite via PyYAML (comments not preserved). Returns True if a pair
-    was removed.
+    Uses ruamel.yaml round-trip so remaining comments/formatting are preserved.
+    Returns True if a pair was removed.
     """
     path = Path(path)
-    raw = yaml.safe_load(path.read_text()) or {}
-    existing = raw.get("pairs") or []
+    y = _ruamel()
+    with path.open("r") as f:
+        data = y.load(f) or {}
 
-    def _norm(sym: str) -> str:
-        return str(sym or "").replace("-", "").replace("/", "").upper()
-
-    target = _norm(mycex_symbol)
-    kept = [e for e in existing if _norm(e.get("mycex") or e.get("source")) != target]
-    if len(kept) == len(existing):
+    existing = data.get("pairs") or []
+    target = _symbol_norm(mycex_symbol)
+    # Remove in place (highest index first) so ruamel keeps surrounding structure.
+    to_remove = [
+        i for i, e in enumerate(existing)
+        if _symbol_norm(e.get("mycex") or e.get("source")) == target
+    ]
+    if not to_remove:
         return False
-    raw["pairs"] = kept
-    path.write_text(yaml.safe_dump(raw, sort_keys=False, default_flow_style=False))
+    for i in reversed(to_remove):
+        del existing[i]
+    with path.open("w") as f:
+        y.dump(data, f)
     log.info("Removed pair %s from %s", mycex_symbol, path)
     return True

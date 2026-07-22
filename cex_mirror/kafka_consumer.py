@@ -63,6 +63,12 @@ class MarketLifecycleConsumer:
                 "Install it (pip install aiokafka) or set kafka.enabled: false."
             ) from e
 
+        brokers = ",".join(self._settings.bootstrap_servers)
+        log.info(
+            "Connecting to Kafka: brokers=%s topic=%s group=%s (%s)...",
+            brokers, self._settings.topic, self._settings.group_id,
+            self._settings.auto_offset_reset,
+        )
         self._consumer = AIOKafkaConsumer(
             self._settings.topic,
             bootstrap_servers=self._settings.bootstrap_servers,
@@ -73,25 +79,42 @@ class MarketLifecycleConsumer:
         )
         await self._consumer.start()
         log.info(
-            "Kafka consumer up: topic=%s brokers=%s group=%s (%s)",
-            self._settings.topic,
-            ",".join(self._settings.bootstrap_servers),
-            self._settings.group_id,
-            self._settings.auto_offset_reset,
+            "Connected to Kafka; consuming topic %r on brokers %s (group=%s). "
+            "Waiting for market-lifecycle events...",
+            self._settings.topic, brokers, self._settings.group_id,
         )
         self._task = asyncio.create_task(self._consume_loop())
 
     async def _consume_loop(self) -> None:
         assert self._consumer is not None
-        try:
-            async for msg in self._consumer:
-                if self._stop.is_set():
-                    break
-                await self._dispatch(msg.value)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.exception("Kafka consume loop crashed")
+        # Poll in batches so a fetch/decode error on one batch (e.g. an unsupported
+        # compression codec) is caught and retried instead of killing the consumer
+        # for the rest of the process's life. Individual message handling errors are
+        # already contained in _dispatch.
+        backoff = 1.0
+        while not self._stop.is_set():
+            try:
+                batches = await self._consumer.getmany(timeout_ms=1000)
+                backoff = 1.0
+                for _tp, messages in batches.items():
+                    for msg in messages:
+                        if self._stop.is_set():
+                            return
+                        await self._dispatch(msg.value)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # Don't die: log and keep polling. A bad/uncompressible batch or a
+                # transient broker hiccup must not permanently stop the consumer.
+                log.error(
+                    "Kafka poll error (%s: %s); retrying in %.1fs",
+                    type(e).__name__, e, backoff,
+                )
+                try:
+                    await asyncio.wait_for(self._stop.wait(), timeout=backoff)
+                except asyncio.TimeoutError:
+                    pass
+                backoff = min(backoff * 2, 30.0)
 
     async def _dispatch(self, raw: bytes) -> None:
         try:
@@ -101,8 +124,16 @@ class MarketLifecycleConsumer:
             return
 
         event_type = str(event.get("event_type", ""))
+        # Log every event that arrives on the topic, so it's visible that the consumer
+        # is live and receiving — not just when something is acted on.
+        log.info(
+            "market-lifecycle event received: type=%s market=%s id=%s",
+            event_type or "<none>",
+            event.get("market_id", "<none>"),
+            event.get("event_id", "<none>"),
+        )
         if event_type not in _HANDLED_EVENT_TYPES:
-            log.debug("Ignoring event_type %r (id=%s)", event_type, event.get("event_id"))
+            log.info("Ignoring event_type %r (not add/remove)", event_type)
             return
 
         try:
