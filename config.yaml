@@ -7,51 +7,40 @@
 mycex:
   jwt_env: MYCEX_JWT  # env var holding the raw JWT
   order_service_url: https://order-exchange.antiers.work
-  max_concurrency: 20
-  max_retries: 4
-  request_timeout: 10.0
+  max_concurrency: 10
+  max_retries: 2
+  request_timeout: 5.0
 
-# Auto-add pairs the admin panel creates. Other services are notified over the
-# `market-lifecycle` Kafka topic; when enabled, this consumer starts mirroring a
-# newly-created/enabled market immediately AND appends it here so a restart resumes it.
-# Pairs Binance does not list are logged and skipped (no source book to mirror).
-kafka:
-  enabled: false
-  bootstrap_servers: localhost:9092  # comma-separated for multiple brokers
-  topic: market-lifecycle
-  group_id: cex-mirror
-  auto_offset_reset: latest  # latest = only new events; earliest = replay history
-
-status_interval: 2.0  # seconds between status prints (0 to disable)
+status_interval: 5.0  # seconds between status prints (0 to disable)
 cancel_on_shutdown: true  # cancel resting orders on Ctrl-C / SIGTERM
-reconcile_on_startup: true  # adopt pre-existing open orders on startup (crash recovery)
+reconcile_on_startup: false  # adopt pre-existing open orders on startup (crash recovery)
 
 defaults:
   levels: 15
   max_order_amount: 0  # 0 = use exact source amount; e.g. 0.001 to cap
   price_precision: "0.01"
-  amount_tolerance: 0.05
-  refresh_interval: 1.0
+  amount_tolerance: 0.10 # 0.05 = 5% of the amount
+  refresh_interval: 1.0  
   mirror_market_orders: true
   max_market_order_amount: 0
-  min_seconds_between_market_orders: 0
+  min_seconds_between_market_orders: 1.0 # 0 = no throttle
   min_notional: 5
 
 # Values below mirror the original conf_binance_to_my_cex_orderbook_mirror_*.yml files.
 pairs:
   - source: BTC-USDT
     mycex: BTC-USDT
-    levels: 60
+    levels: 25
     max_order_amount: 1
     price_precision: "0.01"
     amount_precision: "0.00001"
-    refresh_interval: 1
+    refresh_interval: 5.0
 
-  # - source: ETH-USDT
-  #   mycex: ETH-USDT
-  #   levels: 15
-  #   amount_precision: "0.0001"
-  #   refresh_interval: 1.0
+  #- source: ETH-USDT
+  #  mycex: ETH-USDT
+  #  levels: 30
+  #  amount_precision: "0.0001"
+  #  refresh_interval: 5.0
 
   # - source: SOL-USDT
   #   mycex: SOL-USDT
