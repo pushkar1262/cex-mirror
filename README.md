@@ -100,18 +100,20 @@ Behaviour:
 
 - Handles `market.created`, `market.updated`, `market.state_changed`, and
   `market.delisted` events.
-- **Adding** (`created` / `updated` / `state_changed` with `state: enabled`): only
-  enabled markets are started; other states are ignored (for now).
+- **Adding** (`created` / `updated` / `state_changed` with `state: enabled`): starts
+  mirroring the market.
 - Adding a pair **does not disturb pairs already running** — the new pair gets its own
   Binance subscription and reconcile loop; existing engines/connections are untouched.
 - `tick_size` → price quantization, `step_size` → amount quantization, `min_total` →
   `min_notional`.
 - If **Binance does not list** the pair's symbol (e.g. a custom/test token), it is logged
   and skipped — there's no source book to mirror. The consumer keeps running for others.
-- **Delisting** (`market.delisted`): stops that pair's reconcile loop, cancels all its
-  resting orders, unsubscribes its Binance feed, and removes it from `config.yaml`. Every
-  other running pair is left untouched. The event carries only `market_id` (no `market`
-  object); an unknown/absent id is a harmless no-op.
+- **Removing** — two equivalent triggers stop a running pair: `market.delisted`, and any
+  `created`/`updated`/`state_changed` event with `state: disabled` (`state` is a binary
+  flag, `enabled` | `disabled`). Either one stops that pair's reconcile loop, cancels all
+  its resting orders, unsubscribes its Binance feed, and removes it from `config.yaml`.
+  Every other running pair is left untouched. Removing a pair that isn't running is a
+  harmless no-op.
 - The pair set is persisted via a full PyYAML rewrite of `config.yaml`; hand-written
   comments in that file are not preserved once the first dynamic add/remove is written.
 

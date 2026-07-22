@@ -41,6 +41,20 @@ log = logging.getLogger("cex_mirror.pairs")
 ReconcileLoopFactory = Callable[[MirrorEngine], "asyncio.Task"]
 
 
+def _market_symbol(event: dict) -> str:
+    """No-separator market symbol for an event, e.g. TICSUSDT.
+
+    Prefers base+quote from the `market` object; falls back to `market_id`
+    (which delist events carry directly). Empty string if neither is present.
+    """
+    market = event.get("market") or {}
+    base = str(market.get("base_currency_id") or "").strip().upper()
+    quote = str(market.get("quote_currency_id") or "").strip().upper()
+    if base and quote:
+        return f"{base}{quote}"
+    return str(event.get("market_id") or "").strip().upper()
+
+
 class PairManager:
     def __init__(
         self,
@@ -88,7 +102,9 @@ class PairManager:
         """Entry point for a `market-lifecycle` event.
 
         market.delisted -> stop mirroring the pair and forget it.
-        market.created/updated/state_changed with state=enabled -> start mirroring.
+        created/updated/state_changed with state=enabled  -> start mirroring.
+        created/updated/state_changed with state=disabled -> equivalent to a delist:
+            if the pair is currently running, tear it down and forget it.
         Duplicate/known pairs are a no-op; pairs Binance does not list are skipped.
         """
         event_type = str(event.get("event_type", "")).strip().lower()
@@ -104,16 +120,30 @@ class PairManager:
 
         market = event.get("market") or {}
         state = str(market.get("state", "")).strip().lower()
+
+        # `state` is a binary flag: "enabled" | "disabled". "disabled" is equivalent to a
+        # delist — stop mirroring the pair and forget it. An unrecognised value is left
+        # alone (logged) rather than risk tearing down a live pair on a bad message.
+        if state == "disabled":
+            market_id = _market_symbol(event)
+            if not market_id:
+                log.info("market event %s is disabled but has no resolvable symbol; ignoring",
+                         event.get("event_id"))
+                return
+            log.info("market %s is disabled; stopping mirror (equivalent to delist)", market_id)
+            await self.remove_pair(market_id)
+            return
+
+        if state and state != "enabled":
+            log.warning(
+                "market event %s has unrecognised state %r (expected enabled|disabled); ignoring",
+                event.get("event_id"), state,
+            )
+            return
+
         pair = pair_from_market_event(event, self._cfg.defaults)
         if pair is None:
             return  # already logged why
-
-        if state and state != "enabled":
-            log.info(
-                "market %s is %s (not enabled); not starting mirror for it yet",
-                pair.mycex_symbol, state,
-            )
-            return
 
         await self.add_pair(pair)
 
