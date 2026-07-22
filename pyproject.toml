@@ -11,6 +11,12 @@ dependencies = [
     "python-dotenv>=1.0",
 ]
 
+[project.optional-dependencies]
+# Needed only when kafka.enabled: true (auto-add pairs from the market-lifecycle topic).
+kafka = [
+    "aiokafka>=0.10",
+]
+
 [project.scripts]
 cex-mirror = "cex_mirror.__main__:main"
 

@@ -31,6 +31,7 @@ log = logging.getLogger("cex_mirror.binance")
 
 WS_BASE = "wss://stream.binance.com:9443/stream"
 REST_DEPTH = "https://api.binance.com/api/v3/depth"
+REST_EXCHANGE_INFO = "https://api.binance.com/api/v3/exchangeInfo"
 
 # Streams per WS connection. Binance allows up to 1024; keep headroom.
 STREAMS_PER_CONN = 200
@@ -77,10 +78,34 @@ class BinanceFeed:
         self._trade_callback = trade_callback
         self._session: Optional[aiohttp.ClientSession] = None
         self._tasks: List[asyncio.Task] = []
+        # symbol -> its dedicated connection task, for runtime add/remove_symbol.
+        self._dynamic_conns: Dict[str, asyncio.Task] = {}
         self._stop = asyncio.Event()
 
     def book(self, symbol: str) -> OrderBook:
         return self._books[symbol.upper()]
+
+    def has_symbol(self, symbol: str) -> bool:
+        return symbol.upper() in self._books
+
+    async def symbol_exists_on_binance(self, symbol: str) -> bool:
+        """Whether Binance lists this symbol (TRADING status). Used to skip mirroring
+        admin-created pairs that have no source book (e.g. custom/test tokens)."""
+        assert self._session is not None, "BinanceFeed.start() must run before validation"
+        try:
+            async with self._session.get(
+                REST_EXCHANGE_INFO, params={"symbol": symbol.upper()}
+            ) as resp:
+                if resp.status != 200:
+                    return False
+                data = await resp.json()
+        except Exception as e:
+            log.warning("[binance] exchange-info check failed for %s: %s", symbol, e)
+            return False
+        for s in data.get("symbols", []):
+            if s.get("symbol", "").upper() == symbol.upper():
+                return s.get("status", "").upper() == "TRADING"
+        return False
 
     async def start(self) -> None:
         self._session = aiohttp.ClientSession()
@@ -91,6 +116,53 @@ class BinanceFeed:
         ]
         for idx, chunk in enumerate(chunks):
             self._tasks.append(asyncio.create_task(self._run_connection(idx, chunk)))
+
+    def add_symbol(self, symbol: str) -> bool:
+        """Subscribe a new symbol at runtime on its own WS connection, without
+        touching existing connections. Idempotent. Returns True if newly added.
+
+        Must be called after start() (a session must exist). Each dynamically-added
+        symbol gets a dedicated connection; static startup pairs stay chunked.
+        """
+        symbol = symbol.upper()
+        if symbol in self._books:
+            return False
+        assert self._session is not None, "BinanceFeed.start() must run before add_symbol()"
+        self._symbols.append(symbol)
+        self._books[symbol] = OrderBook()
+        self._diff_buffers[symbol] = []
+        task = asyncio.create_task(self._run_connection(len(self._tasks), [symbol]))
+        self._tasks.append(task)
+        self._dynamic_conns[symbol] = task
+        log.info("[binance] dynamically subscribed %s (conn %d)", symbol, len(self._tasks) - 1)
+        return True
+
+    async def remove_symbol(self, symbol: str) -> bool:
+        """Unsubscribe a runtime-added symbol: tear down its dedicated WS connection
+        and drop its book. Idempotent. Returns True if it was removed.
+
+        Only symbols added via add_symbol() have their own cancellable connection;
+        statically-chunked startup symbols are not individually removable (a delist
+        for one still stops its engine — the book just goes stale, harmlessly).
+        """
+        symbol = symbol.upper()
+        task = self._dynamic_conns.pop(symbol, None)
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            if task in self._tasks:
+                self._tasks.remove(task)
+        removed = symbol in self._books
+        self._books.pop(symbol, None)
+        self._diff_buffers.pop(symbol, None)
+        if symbol in self._symbols:
+            self._symbols.remove(symbol)
+        if removed:
+            log.info("[binance] unsubscribed %s", symbol)
+        return removed
 
     async def stop(self) -> None:
         self._stop.set()

@@ -36,6 +36,32 @@ class MyCexSettings(BaseModel):
     jwt: Optional[str] = None
 
 
+class KafkaSettings(BaseModel):
+    """Consumer for the platform's `market-lifecycle` topic.
+
+    When admins add/enable a pair in the admin panel, other services are notified
+    over Kafka; this consumer lets the mirror auto-start (and persist) that pair so a
+    freshly-created market immediately gets mirrored traffic. Disabled unless
+    `enabled: true` and at least one bootstrap server is set.
+    """
+
+    enabled: bool = False
+    # Comma-separated list also accepted; normalised to a list below.
+    bootstrap_servers: List[str] = ["localhost:9092"]
+    topic: str = "market-lifecycle"
+    group_id: str = "cex-mirror"
+    # Where to start when the group has no committed offset: "latest" (only new
+    # events) or "earliest" (replay history). "latest" is right for live add-a-pair.
+    auto_offset_reset: str = "latest"
+
+    @field_validator("bootstrap_servers", mode="before")
+    @classmethod
+    def _split_servers(cls, v):
+        if isinstance(v, str):
+            return [s.strip() for s in v.split(",") if s.strip()]
+        return v
+
+
 class PairDefaults(BaseModel):
     """Per-pair tunables. Names match the original strategy config exactly."""
 
@@ -77,6 +103,7 @@ class PairConfig(PairDefaults):
 
 class Config(BaseModel):
     mycex: MyCexSettings = MyCexSettings()
+    kafka: KafkaSettings = KafkaSettings()
     defaults: PairDefaults = PairDefaults()
     pairs: List[PairConfig] = []
     # How often to print the status line, in seconds. 0 disables.
@@ -93,6 +120,7 @@ def load_config(path: str | Path) -> Config:
     raw = yaml.safe_load(path.read_text()) or {}
 
     mycex = MyCexSettings(**raw.get("mycex", {}))
+    kafka = KafkaSettings(**raw.get("kafka", {}))
     defaults = PairDefaults(**raw.get("defaults", {}))
 
     # Merge global defaults under each pair's explicit fields.
@@ -111,6 +139,7 @@ def load_config(path: str | Path) -> Config:
 
     cfg = Config(
         mycex=mycex,
+        kafka=kafka,
         defaults=defaults,
         pairs=pairs,
         status_interval=raw.get("status_interval", 30.0),
@@ -126,7 +155,113 @@ def load_config(path: str | Path) -> Config:
         )
     cfg.mycex.jwt = jwt
 
-    if not cfg.pairs:
-        raise RuntimeError("No pairs configured. Add at least one entry under 'pairs:'.")
+    # With Kafka enabled, starting empty is fine — pairs arrive as market-lifecycle
+    # events. Otherwise we need at least one statically-configured pair.
+    if not cfg.pairs and not cfg.kafka.enabled:
+        raise RuntimeError(
+            "No pairs configured. Add at least one entry under 'pairs:', "
+            "or enable the Kafka consumer (kafka.enabled: true) to add pairs at runtime."
+        )
 
     return cfg
+
+
+def pair_from_market_event(event: dict, defaults: PairDefaults) -> Optional[PairConfig]:
+    """Build a PairConfig from a `market-lifecycle` event's `market` object.
+
+    Maps the event's real decimal steps to our quantization fields:
+      price_precision (tick) <- market.tick_size
+      amount_precision (step) <- market.step_size
+    min_notional <- market.min_total when positive (else inherits the default).
+
+    Returns None if the event lacks the fields needed to mirror the pair.
+    """
+    market = event.get("market") or {}
+    base = str(market.get("base_currency_id") or "").strip().upper()
+    quote = str(market.get("quote_currency_id") or "").strip().upper()
+    if not base or not quote:
+        log.warning("market event %s missing base/quote currency; ignoring", event.get("event_id"))
+        return None
+
+    tick = str(market.get("tick_size") or "").strip()
+    step = str(market.get("step_size") or "").strip()
+    # tick_size / step_size of "0" (or empty) are unusable as a quantization step.
+    if not tick or Decimal(tick) <= 0:
+        log.warning("market %s%s has non-positive tick_size %r; ignoring", base, quote, tick)
+        return None
+    if not step or Decimal(step) <= 0:
+        log.warning("market %s%s has non-positive step_size %r; ignoring", base, quote, step)
+        return None
+
+    merged = defaults.model_dump()
+    merged.update(
+        {
+            "source": f"{base}-{quote}",
+            "mycex": f"{base}-{quote}",
+            "price_precision": tick,
+            "amount_precision": step,
+        }
+    )
+    min_total = str(market.get("min_total") or "").strip()
+    if min_total and Decimal(min_total) > 0:
+        merged["min_notional"] = Decimal(min_total)
+
+    return PairConfig(**merged)
+
+
+def append_pair_to_yaml(path: str | Path, pair: PairConfig) -> None:
+    """Persist a runtime-added pair into config.yaml so a restart resumes it.
+
+    Full-file rewrite via PyYAML (comments are not preserved). Idempotent: a pair
+    whose `mycex` already appears under `pairs:` is left untouched.
+    """
+    path = Path(path)
+    raw = yaml.safe_load(path.read_text()) or {}
+    existing = raw.get("pairs") or []
+
+    def _norm(sym: str) -> str:
+        return str(sym or "").replace("-", "").replace("/", "").upper()
+
+    if any(_norm(e.get("mycex") or e.get("source")) == pair.mycex_symbol for e in existing):
+        return
+
+    entry = {
+        "source": pair.source,
+        "mycex": pair.mycex,
+        "levels": pair.levels,
+        "price_precision": pair.price_precision,
+        "amount_precision": pair.amount_precision,
+        "refresh_interval": pair.refresh_interval,
+    }
+    # Only serialise a cap when one is actually set (0 = "use exact source amount").
+    if pair.max_order_amount > 0:
+        entry["max_order_amount"] = str(pair.max_order_amount)
+
+    existing.append(entry)
+    raw["pairs"] = existing
+    path.write_text(yaml.safe_dump(raw, sort_keys=False, default_flow_style=False))
+    log.info("Persisted pair %s to %s", pair.mycex, path)
+
+
+def remove_pair_from_yaml(path: str | Path, mycex_symbol: str) -> bool:
+    """Drop any pair whose symbol matches `mycex_symbol` (no-separator form, e.g.
+    TICSUSDT) from config.yaml so a restart does not resurrect a delisted market.
+
+    Full-file rewrite via PyYAML (comments not preserved). Returns True if a pair
+    was removed.
+    """
+    path = Path(path)
+    raw = yaml.safe_load(path.read_text()) or {}
+    existing = raw.get("pairs") or []
+
+    def _norm(sym: str) -> str:
+        return str(sym or "").replace("-", "").replace("/", "").upper()
+
+    target = _norm(mycex_symbol)
+    kept = [e for e in existing if _norm(e.get("mycex") or e.get("source")) != target]
+    if len(kept) == len(existing):
+        return False
+    raw["pairs"] = kept
+    path.write_text(yaml.safe_dump(raw, sort_keys=False, default_flow_style=False))
+    log.info("Removed pair %s from %s", mycex_symbol, path)
+    return True

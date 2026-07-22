@@ -17,8 +17,10 @@ from typing import Dict, List
 
 from .binance_feed import BinanceFeed
 from .config import Config, load_config
+from .kafka_consumer import MarketLifecycleConsumer
 from .mirror_engine import MirrorEngine
 from .mycex_client import MyCexClient
+from .pair_manager import PairManager
 from .status import format_status
 
 log = logging.getLogger("cex_mirror")
@@ -46,20 +48,21 @@ async def _reconcile_loop(engine: MirrorEngine, stop: asyncio.Event) -> None:
             pass
 
 
-async def _status_loop(engines: List[MirrorEngine], stop: asyncio.Event, interval: float) -> None:
+async def _status_loop(manager: PairManager, stop: asyncio.Event, interval: float) -> None:
     if interval <= 0:
         return
     while not stop.is_set():
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval)
         except asyncio.TimeoutError:
-            print(format_status(engines), flush=True)
+            print(format_status(manager.engines), flush=True)
 
 
-async def run(cfg: Config) -> None:
+async def run(cfg: Config, config_path: str) -> None:
     stop = asyncio.Event()
 
-    # Map Binance symbol -> engine, for routing trade callbacks.
+    # Map Binance symbol -> engine, for routing trade callbacks. Shared with the
+    # PairManager so dynamically-added pairs receive trade-tape events too.
     engines_by_symbol: Dict[str, MirrorEngine] = {}
 
     async def trade_callback(symbol: str, price: str, qty: str, is_buyer_maker: bool) -> None:
@@ -85,21 +88,30 @@ async def run(cfg: Config) -> None:
             log.error("Could not reach my_cex exchange-info (check JWT / URL): %s", e)
             return
 
+        # With Kafka enabled, a market that only mirrors limit orders can still later
+        # be joined by one that mirrors trades; wire the trade callback if EITHER a
+        # configured pair wants it or Kafka may add such a pair.
+        any_market = any(p.mirror_market_orders for p in cfg.pairs) or (
+            cfg.kafka.enabled and cfg.defaults.mirror_market_orders
+        )
         symbols = [p.source_symbol for p in cfg.pairs]
-        any_market = any(p.mirror_market_orders for p in cfg.pairs)
         feed = BinanceFeed(symbols, trade_callback if any_market else None)
-
-        engines: List[MirrorEngine] = []
-        for p in cfg.pairs:
-            eng = MirrorEngine(p, client, feed)
-            engines.append(eng)
-            engines_by_symbol[p.source_symbol] = eng
-
-        # Startup recovery: adopt any pre-existing open orders (crash resilience).
-        if cfg.reconcile_on_startup:
-            await asyncio.gather(*(e.adopt_open_orders() for e in engines))
-
         await feed.start()
+
+        # Factory shared by static + dynamic pairs so their reconcile loops are identical.
+        def start_reconcile_loop(engine: MirrorEngine) -> asyncio.Task:
+            return asyncio.create_task(_reconcile_loop(engine, stop))
+
+        manager = PairManager(
+            cfg, client, feed, engines_by_symbol, start_reconcile_loop, config_path
+        )
+
+        # Register statically-configured pairs (startup recovery, then reconcile loop).
+        static_engines = [MirrorEngine(p, client, feed) for p in cfg.pairs]
+        if cfg.reconcile_on_startup and static_engines:
+            await asyncio.gather(*(e.adopt_open_orders() for e in static_engines))
+        for eng in static_engines:
+            manager.register_static(eng, start_reconcile_loop(eng))
 
         # Signal handling for graceful shutdown.
         loop = asyncio.get_running_loop()
@@ -109,21 +121,38 @@ async def run(cfg: Config) -> None:
             except NotImplementedError:
                 pass  # e.g. Windows
 
-        tasks = [asyncio.create_task(_reconcile_loop(e, stop)) for e in engines]
-        tasks.append(asyncio.create_task(_status_loop(engines, stop, cfg.status_interval)))
+        status_task = asyncio.create_task(_status_loop(manager, stop, cfg.status_interval))
 
-        log.info("Mirror running for %d pair(s). Ctrl-C to stop.", len(engines))
+        # Start the market-lifecycle consumer so admin-created pairs auto-start.
+        consumer: MarketLifecycleConsumer | None = None
+        if cfg.kafka.enabled:
+            consumer = MarketLifecycleConsumer(cfg.kafka, manager.handle_market_event)
+            try:
+                await consumer.start()
+            except Exception as e:
+                log.error("Kafka consumer failed to start (continuing without it): %s", e)
+                consumer = None
+
+        log.info(
+            "Mirror running for %d pair(s)%s. Ctrl-C to stop.",
+            len(manager.engines),
+            " + live add-a-pair via Kafka" if consumer else "",
+        )
         await stop.wait()
         log.info("Shutting down...")
 
-        for t in tasks:
+        if consumer is not None:
+            await consumer.stop()
+
+        status_task.cancel()
+        for t in manager.tasks:
             t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(status_task, *manager.tasks, return_exceptions=True)
         await feed.stop()
 
         if cfg.cancel_on_shutdown:
             log.info("Cancelling all resting orders...")
-            results = await asyncio.gather(*(e.cancel_all() for e in engines))
+            results = await asyncio.gather(*(e.cancel_all() for e in manager.engines))
             log.info("Cancelled %d resting order(s).", sum(results))
 
 
@@ -146,7 +175,7 @@ def main() -> None:
         sys.exit(1)
 
     try:
-        asyncio.run(run(cfg))
+        asyncio.run(run(cfg, args.config))
     except KeyboardInterrupt:
         pass
 

@@ -11,6 +11,17 @@ mycex:
   max_retries: 4
   request_timeout: 10.0
 
+# Auto-add pairs the admin panel creates. Other services are notified over the
+# `market-lifecycle` Kafka topic; when enabled, this consumer starts mirroring a
+# newly-created/enabled market immediately AND appends it here so a restart resumes it.
+# Pairs Binance does not list are logged and skipped (no source book to mirror).
+kafka:
+  enabled: false
+  bootstrap_servers: localhost:9092  # comma-separated for multiple brokers
+  topic: market-lifecycle
+  group_id: cex-mirror
+  auto_offset_reset: latest  # latest = only new events; earliest = replay history
+
 status_interval: 2.0  # seconds between status prints (0 to disable)
 cancel_on_shutdown: true  # cancel resting orders on Ctrl-C / SIGTERM
 reconcile_on_startup: true  # adopt pre-existing open orders on startup (crash recovery)

@@ -74,16 +74,62 @@ field. `mycex.jwt_env` names the environment variable holding the JWT.
 `reconcile_on_startup` adopts any pre-existing open orders at boot (so a crash/kill -9
 never leaves orphaned orders on the book).
 
+## Auto-adding pairs (admin panel / Kafka)
+
+When an admin adds a pair in the platform's admin panel, the platform emits an event on
+the `market-lifecycle` Kafka topic. Enable the consumer and the mirror will **start
+mirroring a newly-created/enabled market immediately** — a brand-new market gets traffic
+as soon as it exists — and **append the pair to `config.yaml`** so a restart resumes it.
+
+```yaml
+kafka:
+  enabled: true
+  bootstrap_servers: broker1:9092,broker2:9092
+  topic: market-lifecycle
+  group_id: cex-mirror
+  auto_offset_reset: latest   # latest = only new events; earliest = replay history
+```
+
+Install the extra (already included in the Docker image):
+
+```bash
+pip install ".[kafka]"
+```
+
+Behaviour:
+
+- Handles `market.created`, `market.updated`, `market.state_changed`, and
+  `market.delisted` events.
+- **Adding** (`created` / `updated` / `state_changed` with `state: enabled`): only
+  enabled markets are started; other states are ignored (for now).
+- Adding a pair **does not disturb pairs already running** — the new pair gets its own
+  Binance subscription and reconcile loop; existing engines/connections are untouched.
+- `tick_size` → price quantization, `step_size` → amount quantization, `min_total` →
+  `min_notional`.
+- If **Binance does not list** the pair's symbol (e.g. a custom/test token), it is logged
+  and skipped — there's no source book to mirror. The consumer keeps running for others.
+- **Delisting** (`market.delisted`): stops that pair's reconcile loop, cancels all its
+  resting orders, unsubscribes its Binance feed, and removes it from `config.yaml`. Every
+  other running pair is left untouched. The event carries only `market_id` (no `market`
+  object); an unknown/absent id is a harmless no-op.
+- The pair set is persisted via a full PyYAML rewrite of `config.yaml`; hand-written
+  comments in that file are not preserved once the first dynamic add/remove is written.
+
+With `kafka.enabled: true` you may start with an empty `pairs:` list and let every pair
+arrive over Kafka.
+
 ## Layout
 
 | File | Responsibility |
 |------|----------------|
-| `config.py` | Load/validate YAML, apply defaults, resolve JWT from env |
-| `binance_feed.py` | Shared Binance WS: multiplexed depth+trade, in-memory books |
+| `config.py` | Load/validate YAML, apply defaults, resolve JWT from env, event→pair mapping + config persistence |
+| `binance_feed.py` | Shared Binance WS: multiplexed depth+trade, in-memory books, runtime symbol add + validation |
 | `mycex_client.py` | Async REST client (exchange-info, place, cancel, open-orders) |
 | `quantize.py` | Decimal price/amount quantization + min-notional filter |
 | `order_tracker.py` | In-memory per-pair resting-order state |
 | `mirror_engine.py` | Per-pair reconcile loop + trade-tape handler |
+| `kafka_consumer.py` | Consume `market-lifecycle`, dispatch market events |
+| `pair_manager.py` | Live engine registry; dynamic add-a-pair without disturbing running pairs |
 | `status.py` | Periodic status line |
 | `__main__.py` | Wire everything, run the event loop, handle shutdown |
 ```
