@@ -7,9 +7,12 @@
 mycex:
   jwt_env: MYCEX_JWT  # env var holding the raw JWT
   order_service_url: https://order-exchange.antiers.work
+  exchange_info_path: /api/v1/exchange-info  # relative to order_service_url
+  orders_path: /api/v1/orders  # POST place, DELETE /{id} cancel, GET ?status=pending open-orders
   max_concurrency: 10
   max_retries: 2
   request_timeout: 5.0
+  bootstrap_retry_interval: 10.0  # if exchange-info is down at boot, retry every Ns (capped) instead of exiting
 
 # Auto-add/remove pairs the admin panel creates. Other services are notified over the
 # `market-lifecycle` Kafka topic; when enabled, this consumer starts mirroring a

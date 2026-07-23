@@ -92,6 +92,12 @@ are skipped. Configured pairs the order service doesn't list yet are queued and 
 (see below). Nothing discovered from `exchange-info` is written back to `config.yaml`;
 it's re-read on every restart.
 
+If the order service is **unreachable at startup**, the mirror does not exit — it keeps
+retrying `exchange-info` every `mycex.bootstrap_retry_interval` seconds (capped backoff)
+and bootstraps once it comes online. The Kafka consumer starts immediately regardless, so
+lifecycle events are handled while waiting. The order service's base URL and API paths are
+configurable under `mycex:` (`order_service_url`, `exchange_info_path`, `orders_path`).
+
 ## Auto-adding pairs (admin panel / Kafka)
 
 When an admin adds a pair in the platform's admin panel, the platform emits an event on

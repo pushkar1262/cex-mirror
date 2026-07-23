@@ -125,6 +125,42 @@ def _bootstrap_pairs(cfg: Config, exchange_info: list) -> list[PairConfig]:
     return pairs
 
 
+async def _bootstrap_loop(
+    cfg: Config, client: MyCexClient, manager: PairManager, stop: asyncio.Event
+) -> None:
+    """Fetch exchange-info and start every active market. If the order service is
+    unreachable, keep retrying (capped backoff) instead of exiting — so a down service
+    at boot only delays mirroring, never prevents startup. Runs once it succeeds."""
+    interval = cfg.mycex.bootstrap_retry_interval
+    backoff = interval
+    while not stop.is_set():
+        try:
+            info = await client.exchange_info()
+        except Exception as e:
+            log.warning(
+                "exchange-info unreachable (%s); retrying in %.0fs (order service may be down)",
+                e, backoff,
+            )
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=backoff)
+            except asyncio.TimeoutError:
+                pass
+            backoff = min(backoff * 2, 60.0)
+            continue
+
+        log.info("Connected to my_cex; %d symbol(s) reported.", len(info))
+        bootstrap_pairs = _bootstrap_pairs(cfg, info)
+        if bootstrap_pairs:
+            log.info("Bootstrapping %d active market(s) from exchange-info.", len(bootstrap_pairs))
+            await asyncio.gather(
+                *(manager.add_pair(p, persist=False) for p in bootstrap_pairs),
+                return_exceptions=True,
+            )
+        else:
+            log.info("No active markets to bootstrap yet.")
+        return  # done; lifecycle changes handled by Kafka + pending-retry from here
+
+
 async def run(cfg: Config, config_path: str) -> None:
     stop = asyncio.Event()
 
@@ -143,25 +179,18 @@ async def run(cfg: Config, config_path: str) -> None:
     async with MyCexClient(
         cfg.mycex.order_service_url,
         cfg.mycex.jwt,
+        exchange_info_path=cfg.mycex.exchange_info_path,
+        orders_path=cfg.mycex.orders_path,
         max_concurrency=cfg.mycex.max_concurrency,
         max_retries=cfg.mycex.max_retries,
         request_timeout=cfg.mycex.request_timeout,
     ) as client:
-        # Sanity check the JWT / connectivity via exchange-info (also warms trading rules).
-        try:
-            info = await client.exchange_info()
-            log.info("Connected to my_cex; %d symbols reported.", len(info))
-        except Exception as e:
-            log.error("Could not reach my_cex exchange-info (check JWT / URL): %s", e)
-            return
-
-        # Build the startup pair set from the order service's active markets, applying
-        # a config.yaml override where one exists (else the market's own trading rules).
-        bootstrap_pairs = _bootstrap_pairs(cfg, info)
-
-        # Trades are mirrored if any startup pair wants it, or Kafka may add such a pair.
-        any_market = any(p.mirror_market_orders for p in bootstrap_pairs) or (
-            cfg.kafka.enabled and cfg.defaults.mirror_market_orders
+        # Trades are mirrored whenever the defaults (or any configured pair) enable it.
+        # We can't yet know the bootstrap set (exchange-info may be down and retried in
+        # the background), so wire the callback on the broader condition — an unmatched
+        # callback is a harmless no-op.
+        any_market = cfg.defaults.mirror_market_orders or any(
+            p.mirror_market_orders for p in cfg.pairs
         )
         # Feed starts empty; every pair (startup or Kafka) subscribes dynamically via add_pair.
         feed = BinanceFeed([], trade_callback if any_market else None)
@@ -175,13 +204,6 @@ async def run(cfg: Config, config_path: str) -> None:
             cfg, client, feed, engines_by_symbol, start_reconcile_loop, config_path
         )
 
-        # Start every active market through the same path as Kafka-added pairs. Each is
-        # gated on Binance availability + order-service registration (already satisfied
-        # for exchange-info markets). persist=False: don't rewrite config.yaml at boot.
-        if bootstrap_pairs:
-            log.info("Bootstrapping %d active market(s) from exchange-info.", len(bootstrap_pairs))
-            await asyncio.gather(*(manager.add_pair(p, persist=False) for p in bootstrap_pairs))
-
         # Signal handling for graceful shutdown.
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
@@ -191,6 +213,11 @@ async def run(cfg: Config, config_path: str) -> None:
                 pass  # e.g. Windows
 
         aux_tasks = [asyncio.create_task(_status_loop(manager, stop, cfg.status_interval))]
+
+        # Bootstrap active markets from exchange-info in the background: if the order
+        # service is momentarily down, keep retrying instead of failing to start. Kafka
+        # (below) runs meanwhile, so lifecycle events are handled while we wait.
+        aux_tasks.append(asyncio.create_task(_bootstrap_loop(cfg, client, manager, stop)))
 
         # Start the market-lifecycle consumer so admin-created pairs auto-start.
         consumer: MarketLifecycleConsumer | None = None
@@ -207,9 +234,8 @@ async def run(cfg: Config, config_path: str) -> None:
             ))
 
         log.info(
-            "Mirror running for %d pair(s)%s. Ctrl-C to stop.",
-            len(manager.engines),
-            " + live add-a-pair via Kafka" if consumer else "",
+            "Mirror started%s. Bootstrapping markets from exchange-info. Ctrl-C to stop.",
+            " with live add-a-pair via Kafka" if consumer else "",
         )
         await stop.wait()
         log.info("Shutting down...")

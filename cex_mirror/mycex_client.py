@@ -35,12 +35,16 @@ class MyCexClient:
         base_url: str,
         jwt: str,
         *,
+        exchange_info_path: str = "/api/v1/exchange-info",
+        orders_path: str = "/api/v1/orders",
         max_concurrency: int = 20,
         max_retries: int = 2,
         request_timeout: float = 10.0,
     ):
         self._base = base_url.rstrip("/")
         self._jwt = jwt
+        self._exchange_info_path = "/" + exchange_info_path.strip("/")
+        self._orders_path = "/" + orders_path.strip("/")
         self._max_retries = max_retries
         self._sem = asyncio.Semaphore(max_concurrency)
         self._timeout = aiohttp.ClientTimeout(total=request_timeout)
@@ -105,7 +109,7 @@ class MyCexClient:
     # ------------------------------------------------------------------
 
     async def exchange_info(self) -> List[Dict[str, Any]]:
-        data = await self._request("GET", "/api/v1/exchange-info")
+        data = await self._request("GET", self._exchange_info_path)
         return data if isinstance(data, list) else data.get("symbols", [])
 
     async def symbol_known(self, symbol: str) -> bool:
@@ -146,7 +150,7 @@ class MyCexClient:
                 return None
             body["price"] = f"{price:f}"
         try:
-            result = await self._request("POST", "/api/v1/orders", json=body)
+            result = await self._request("POST", self._orders_path, json=body)
         except MyCexError as e:
             log.error(
                 "[place] FAILED %s %s %s qty=%s price=%s -> %s",
@@ -165,7 +169,7 @@ class MyCexClient:
     async def cancel_order(self, exchange_order_id: str) -> bool:
         """Cancel by exchange orderID. Returns True on success, False on failure (logged)."""
         try:
-            await self._request("DELETE", f"/api/v1/orders/{exchange_order_id}")
+            await self._request("DELETE", f"{self._orders_path}/{exchange_order_id}")
             return True
         except MyCexError as e:
             # "order not found" means it already filled/cancelled — not an error worth alarming on.
@@ -179,7 +183,7 @@ class MyCexClient:
         """Pre-existing open orders for a pair, used for startup recovery."""
         try:
             data = await self._request(
-                "GET", "/api/v1/orders", params={"status": "pending", "market": market}
+                "GET", self._orders_path, params={"status": "pending", "market": market}
             )
         except MyCexError as e:
             log.error("[open_orders] FAILED for %s -> %s", market, e)

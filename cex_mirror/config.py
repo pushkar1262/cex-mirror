@@ -26,11 +26,19 @@ class MyCexSettings(BaseModel):
     # Raw JWT is read from this environment variable (never stored in the file).
     jwt_env: str = "MYCEX_JWT"
     order_service_url: str = "https://order-exchange.antiers.work"
+    # API paths (relative to order_service_url), configurable so a different order
+    # service layout needs no code change. The orders path is used for POST (place),
+    # DELETE /{id} (cancel), and GET ?status=pending&market= (open-orders).
+    exchange_info_path: str = "/api/v1/exchange-info"
+    orders_path: str = "/api/v1/orders"
     # Max concurrent in-flight REST requests to my_cex (shared across all pairs).
     max_concurrency: int = 20
     # Light retry on transient failures, mirrors the old API_MAX_RETRIES.
     max_retries: int = 2
     request_timeout: float = 10.0
+    # If exchange-info is unreachable at startup, keep retrying every this-many seconds
+    # (with capped backoff) instead of exiting — the mirror starts once it comes online.
+    bootstrap_retry_interval: float = 10.0
 
     # Resolved at load time from `jwt_env`.
     jwt: Optional[str] = None
