@@ -74,6 +74,24 @@ field. `mycex.jwt_env` names the environment variable holding the JWT.
 `reconcile_on_startup` adopts any pre-existing open orders at boot (so a crash/kill -9
 never leaves orphaned orders on the book).
 
+## What gets mirrored (startup)
+
+On boot the mirror fetches the order service's `exchange-info` and starts mirroring
+**every active (`TRADING`) market** — you do not have to list pairs by hand. For each
+market:
+
+- if `config.yaml` has a `pairs:` entry for that symbol, that entry is used (your
+  hand-tuned `levels`, `max_order_amount`, precision, etc.);
+- otherwise the market is mirrored using the order service's own trading rules
+  (`TickSize` → price precision, `StepSize` → amount precision, `MinNotional` →
+  min-notional) over the global `defaults`.
+
+So `config.yaml` `pairs:` are **optional overrides**, not the source of truth — an empty
+`pairs:` list mirrors all active markets with defaults. Inactive (non-`TRADING`) markets
+are skipped. Configured pairs the order service doesn't list yet are queued and retried
+(see below). Nothing discovered from `exchange-info` is written back to `config.yaml`;
+it's re-read on every restart.
+
 ## Auto-adding pairs (admin panel / Kafka)
 
 When an admin adds a pair in the platform's admin panel, the platform emits an event on

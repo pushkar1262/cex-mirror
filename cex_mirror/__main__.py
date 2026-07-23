@@ -16,7 +16,13 @@ import sys
 from typing import Dict, List
 
 from .binance_feed import BinanceFeed
-from .config import Config, load_config
+from .config import (
+    Config,
+    PairConfig,
+    exchange_info_is_active,
+    load_config,
+    pair_from_exchange_info,
+)
 from .kafka_consumer import MarketLifecycleConsumer
 from .mirror_engine import MirrorEngine
 from .mycex_client import MyCexClient
@@ -79,6 +85,46 @@ async def _pending_retry_loop(manager: PairManager, stop: asyncio.Event, interva
                 log.exception("pending-pair retry error")
 
 
+def _bootstrap_pairs(cfg: Config, exchange_info: list) -> list[PairConfig]:
+    """The set of pairs to start at boot: every ACTIVE market on the order service,
+    plus any explicitly-configured pair not (yet) listed there.
+
+    A market with a matching entry in config.yaml uses that entry (hand-tuned levels,
+    caps, precision overrides); a market with no config entry is built from the order
+    service's own trading rules (tick/step/min-notional) over the global defaults.
+    Config pairs absent from exchange-info are still included — add_pair will gate them
+    on order-service registration and queue them until they appear.
+    """
+    from .config import symbol_norm  # local: normaliser lives with the config models
+
+    overrides = {p.mycex_symbol: p for p in cfg.pairs}
+    used_overrides: set[str] = set()
+    pairs: list[PairConfig] = []
+
+    for entry in exchange_info:
+        symbol = symbol_norm(entry.get("Symbol") or entry.get("symbol"))
+        if not symbol:
+            continue
+        if not exchange_info_is_active(entry):
+            log.info("Skipping inactive market %s (status=%s)", symbol, entry.get("Status"))
+            continue
+        if symbol in overrides:
+            pairs.append(overrides[symbol])
+            used_overrides.add(symbol)
+        else:
+            p = pair_from_exchange_info(entry, cfg.defaults)
+            if p is not None:
+                pairs.append(p)
+
+    # Include configured pairs the order service didn't list (queued for retry by add_pair).
+    for sym, p in overrides.items():
+        if sym not in used_overrides:
+            log.info("Configured pair %s not in exchange-info; will queue until registered", sym)
+            pairs.append(p)
+
+    return pairs
+
+
 async def run(cfg: Config, config_path: str) -> None:
     stop = asyncio.Event()
 
@@ -109,14 +155,16 @@ async def run(cfg: Config, config_path: str) -> None:
             log.error("Could not reach my_cex exchange-info (check JWT / URL): %s", e)
             return
 
-        # With Kafka enabled, a market that only mirrors limit orders can still later
-        # be joined by one that mirrors trades; wire the trade callback if EITHER a
-        # configured pair wants it or Kafka may add such a pair.
-        any_market = any(p.mirror_market_orders for p in cfg.pairs) or (
+        # Build the startup pair set from the order service's active markets, applying
+        # a config.yaml override where one exists (else the market's own trading rules).
+        bootstrap_pairs = _bootstrap_pairs(cfg, info)
+
+        # Trades are mirrored if any startup pair wants it, or Kafka may add such a pair.
+        any_market = any(p.mirror_market_orders for p in bootstrap_pairs) or (
             cfg.kafka.enabled and cfg.defaults.mirror_market_orders
         )
-        symbols = [p.source_symbol for p in cfg.pairs]
-        feed = BinanceFeed(symbols, trade_callback if any_market else None)
+        # Feed starts empty; every pair (startup or Kafka) subscribes dynamically via add_pair.
+        feed = BinanceFeed([], trade_callback if any_market else None)
         await feed.start()
 
         # Factory shared by static + dynamic pairs so their reconcile loops are identical.
@@ -127,11 +175,12 @@ async def run(cfg: Config, config_path: str) -> None:
             cfg, client, feed, engines_by_symbol, start_reconcile_loop, config_path
         )
 
-        # Start statically-configured pairs through the same path as Kafka-added ones,
-        # so a configured pair the order service doesn't know yet is queued (and retried)
-        # rather than spamming "unknown market" 400s. persist=False: already in config.
-        if cfg.pairs:
-            await asyncio.gather(*(manager.add_pair(p, persist=False) for p in cfg.pairs))
+        # Start every active market through the same path as Kafka-added pairs. Each is
+        # gated on Binance availability + order-service registration (already satisfied
+        # for exchange-info markets). persist=False: don't rewrite config.yaml at boot.
+        if bootstrap_pairs:
+            log.info("Bootstrapping %d active market(s) from exchange-info.", len(bootstrap_pairs))
+            await asyncio.gather(*(manager.add_pair(p, persist=False) for p in bootstrap_pairs))
 
         # Signal handling for graceful shutdown.
         loop = asyncio.get_running_loop()

@@ -158,14 +158,9 @@ def load_config(path: str | Path) -> Config:
         )
     cfg.mycex.jwt = jwt
 
-    # With Kafka enabled, starting empty is fine — pairs arrive as market-lifecycle
-    # events. Otherwise we need at least one statically-configured pair.
-    if not cfg.pairs and not cfg.kafka.enabled:
-        raise RuntimeError(
-            "No pairs configured. Add at least one entry under 'pairs:', "
-            "or enable the Kafka consumer (kafka.enabled: true) to add pairs at runtime."
-        )
-
+    # Starting with an empty `pairs:` list is fine: at boot the mirror discovers every
+    # active market from the order service's exchange-info, and (if Kafka is enabled)
+    # tracks lifecycle changes thereafter. config.yaml entries are optional overrides.
     return cfg
 
 
@@ -212,7 +207,63 @@ def pair_from_market_event(event: dict, defaults: PairDefaults) -> Optional[Pair
     return PairConfig(**merged)
 
 
-def _symbol_norm(sym) -> str:
+def pair_from_exchange_info(entry: dict, defaults: PairDefaults) -> Optional[PairConfig]:
+    """Build a PairConfig from a my_cex exchange-info entry (the startup bootstrap
+    source), for a market with no explicit config.yaml override.
+
+    Maps the order service's own trading rules to our fields:
+      price_precision (tick) <- TickSize
+      amount_precision (step) <- StepSize
+      min_notional          <- MinNotional (when positive)
+    Everything else (levels, refresh_interval, mirror_market_orders, ...) comes from
+    the global defaults. Returns None if the entry lacks usable tick/step.
+    """
+    symbol = str(entry.get("Symbol") or entry.get("symbol") or "").strip().upper()
+    base = str(entry.get("BaseAsset") or entry.get("baseAsset") or "").strip().upper()
+    quote = str(entry.get("QuoteAsset") or entry.get("quoteAsset") or "").strip().upper()
+    if not (base and quote) and symbol:
+        # Fall back to splitting the symbol on the known quote if assets are absent.
+        for q in ("USDT", "USDC", "BTC", "ETH", "BUSD"):
+            if symbol.endswith(q) and len(symbol) > len(q):
+                base, quote = symbol[: -len(q)], q
+                break
+    if not base or not quote:
+        log.warning("exchange-info entry %r missing base/quote; skipping", symbol or entry)
+        return None
+
+    tick = str(entry.get("TickSize") or entry.get("tickSize") or "").strip()
+    step = str(entry.get("StepSize") or entry.get("stepSize") or "").strip()
+    if not tick or Decimal(tick) <= 0:
+        log.warning("market %s has non-positive TickSize %r; skipping", symbol, tick)
+        return None
+    if not step or Decimal(step) <= 0:
+        log.warning("market %s has non-positive StepSize %r; skipping", symbol, step)
+        return None
+
+    merged = defaults.model_dump()
+    merged.update(
+        {
+            "source": f"{base}-{quote}",
+            "mycex": f"{base}-{quote}",
+            "price_precision": tick,
+            "amount_precision": step,
+        }
+    )
+    min_notional = str(entry.get("MinNotional") or entry.get("minNotional") or "").strip()
+    if min_notional and Decimal(min_notional) > 0:
+        merged["min_notional"] = Decimal(min_notional)
+
+    return PairConfig(**merged)
+
+
+def exchange_info_is_active(entry: dict) -> bool:
+    """Whether an exchange-info entry is an active/tradeable market."""
+    status = str(entry.get("Status") or entry.get("status") or "").strip().upper()
+    # Empty status treated as active (lenient on field shape); else must be TRADING.
+    return status in ("", "TRADING")
+
+
+def symbol_norm(sym) -> str:
     """No-separator upper form, e.g. 'BTC-USDT' -> 'BTCUSDT'."""
     return str(sym or "").replace("-", "").replace("/", "").upper()
 
@@ -247,7 +298,7 @@ def append_pair_to_yaml(path: str | Path, pair: PairConfig) -> None:
         existing = CommentedSeq()
         data["pairs"] = existing
 
-    if any(_symbol_norm(e.get("mycex") or e.get("source")) == pair.mycex_symbol for e in existing):
+    if any(symbol_norm(e.get("mycex") or e.get("source")) == pair.mycex_symbol for e in existing):
         return
 
     from ruamel.yaml.comments import CommentedMap
@@ -288,11 +339,11 @@ def remove_pair_from_yaml(path: str | Path, mycex_symbol: str) -> bool:
         data = y.load(f) or {}
 
     existing = data.get("pairs") or []
-    target = _symbol_norm(mycex_symbol)
+    target = symbol_norm(mycex_symbol)
     # Remove in place (highest index first) so ruamel keeps surrounding structure.
     to_remove = [
         i for i, e in enumerate(existing)
-        if _symbol_norm(e.get("mycex") or e.get("source")) == target
+        if symbol_norm(e.get("mycex") or e.get("source")) == target
     ]
     if not to_remove:
         return False
