@@ -25,7 +25,7 @@ kafka:
   group_id: cex-mirror
   auto_offset_reset: latest  # latest = only new events; earliest = replay history
 
-status_interval: 5.0  # seconds between status prints (0 to disable)
+status_interval: 10.0  # seconds between status prints (0 to disable)
 cancel_on_shutdown: true  # cancel resting orders on Ctrl-C / SIGTERM
 reconcile_on_startup: false  # adopt pre-existing open orders on startup (crash recovery)
 

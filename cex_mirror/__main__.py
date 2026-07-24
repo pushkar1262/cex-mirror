@@ -223,11 +223,20 @@ async def run(cfg: Config, config_path: str) -> None:
         consumer: MarketLifecycleConsumer | None = None
         if cfg.kafka.enabled:
             consumer = MarketLifecycleConsumer(cfg.kafka, manager.handle_market_event)
+            # Fail fast: kafka.enabled means the market-lifecycle consumer is load-bearing
+            # (it's how pairs are disabled/delisted). Silently continuing without it lets
+            # the mirror keep quoting a disabled market — so surface the failure and exit
+            # rather than run half-configured. Set kafka.enabled: false to run without it.
             try:
                 await consumer.start()
             except Exception as e:
-                log.error("Kafka consumer failed to start (continuing without it): %s", e)
-                consumer = None
+                log.error(
+                    "Kafka consumer failed to start and kafka.enabled is true; aborting. "
+                    "Fix the broker/dependencies, or set kafka.enabled: false to run "
+                    "without live pair lifecycle. Cause: %s",
+                    e,
+                )
+                raise
             # Retry pairs the order service didn't know yet (only meaningful with Kafka).
             aux_tasks.append(asyncio.create_task(
                 _pending_retry_loop(manager, stop, cfg.kafka.pending_retry_interval)

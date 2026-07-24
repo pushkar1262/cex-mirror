@@ -9,13 +9,10 @@ dependencies = [
     "pydantic>=2.5",
     "pyyaml>=6.0",
     "python-dotenv>=1.0",
-]
-
-[project.optional-dependencies]
-# Needed only when kafka.enabled: true (auto-add pairs from the market-lifecycle topic).
-# cramjam supplies the snappy/lz4/zstd/gzip decompression codecs aiokafka needs when the
-# producer compresses messages (snappy is a common broker/producer default).
-kafka = [
+    # Kafka market-lifecycle consumer (auto-add/remove pairs). Required: the service
+    # runs with kafka.enabled: true and fails fast at startup if these are missing.
+    # cramjam supplies the snappy/lz4/zstd/gzip decompression codecs aiokafka needs when
+    # the producer compresses messages (snappy is a common broker/producer default).
     "aiokafka>=0.10",
     "cramjam>=2.7",
     # Round-trip YAML so runtime add/remove of pairs preserves config.yaml comments.
